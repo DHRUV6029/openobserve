@@ -20,6 +20,7 @@
 
 use axum::response::Response as HttpResponse;
 use common::meta::http::HttpResponse as MetaHttpResponse;
+use config::utils::sql::{quote_identifier, quote_sql_string};
 use serde::Deserialize;
 
 /// Query parameters for service graph API
@@ -141,10 +142,10 @@ async fn topology_v1(
     // byte-identical to the pre-B4 query (backward compatible). The
     // `_o2_service_graph` stream has NO `agent_version` column, so we never
     // reference version here.
-    let agent_pred: Option<String> = query.agent_env.as_deref().map(|env| {
-        let escaped = env.replace('\'', "''");
-        format!("agent_env = '{escaped}'")
-    });
+    let agent_pred: Option<String> = query
+        .agent_env
+        .as_deref()
+        .map(|env| format!("agent_env = {}", quote_sql_string(env)));
 
     // 1. Query current window
     let edges = match query_edges_from_stream_internal(
@@ -300,7 +301,7 @@ fn aggregate_baselines(
 ///
 /// NOTE: This stream is version-agnostic — there is no `agent_version` column,
 /// so predicates must never reference it.
-#[cfg(feature = "enterprise")]
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
 fn build_edges_sql(
     stream_name: &str,
     stream_filter: Option<&str>,
@@ -312,24 +313,67 @@ fn build_edges_sql(
     let agent_clause = agent_pred
         .map(|p| format!("\n             AND {p}"))
         .unwrap_or_default();
+    let table = quote_identifier(stream_name);
+    let org = quote_sql_string(org_id);
     if let Some(stream) = stream_filter {
+        let stream = quote_sql_string(stream);
         format!(
-            "SELECT * FROM \"{}\"
-             WHERE _timestamp >= {} AND _timestamp < {}
-             AND org_id = '{}'
-             AND trace_stream_name = '{}'{}
-             LIMIT 10000",
-            stream_name, start_time, end_time, org_id, stream, agent_clause
+            "SELECT * FROM {table}
+             WHERE _timestamp >= {start_time} AND _timestamp < {end_time}
+             AND org_id = {org}
+             AND trace_stream_name = {stream}{agent_clause}
+             LIMIT 10000"
         )
     } else {
         format!(
-            "SELECT * FROM \"{}\"
-             WHERE _timestamp >= {} AND _timestamp < {}
-             AND org_id = '{}'{}
-             LIMIT 10000",
-            stream_name, start_time, end_time, org_id, agent_clause
+            "SELECT * FROM {table}
+             WHERE _timestamp >= {start_time} AND _timestamp < {end_time}
+             AND org_id = {org}{agent_clause}
+             LIMIT 10000"
         )
     }
+}
+
+/// Build the SQL used to read a single edge's latency history from the `_o2_service_graph`
+/// stream. Pure helper (no DB access) so the query construction can be unit-tested.
+#[cfg_attr(not(feature = "enterprise"), allow(dead_code))]
+fn build_edge_history_sql(
+    stream_name: &str,
+    org_id: &str,
+    client_service: Option<&str>,
+    server_service: Option<&str>,
+    stream_filter: Option<&str>,
+    start_time: i64,
+    end_time: i64,
+) -> String {
+    let mut filters = format!(
+        "_timestamp >= {start_time} AND _timestamp < {end_time} AND org_id = {}",
+        quote_sql_string(org_id)
+    );
+    if let Some(client) = client_service {
+        filters.push_str(&format!(
+            " AND client_service = {}",
+            quote_sql_string(client)
+        ));
+    }
+    if let Some(server) = server_service {
+        filters.push_str(&format!(
+            " AND server_service = {}",
+            quote_sql_string(server)
+        ));
+    }
+    if let Some(stream) = stream_filter {
+        filters.push_str(&format!(
+            " AND trace_stream_name = {}",
+            quote_sql_string(stream)
+        ));
+    }
+    format!(
+        "SELECT _timestamp, p50_latency_ns, p95_latency_ns, p99_latency_ns, \
+         total_requests, failed_requests \
+         FROM {} WHERE {filters} ORDER BY _timestamp ASC LIMIT 10000",
+        quote_identifier(stream_name)
+    )
 }
 
 #[cfg(feature = "enterprise")]
@@ -489,25 +533,14 @@ pub async fn get_edge_history(
             (now - window_24h, now)
         };
 
-    let mut filters = format!(
-        "_timestamp >= {} AND _timestamp < {} AND org_id = '{}'",
-        start_time, end_time, org_id
-    );
-    if let Some(ref client) = query.client_service {
-        filters.push_str(&format!(" AND client_service = '{}'", client));
-    }
-    if let Some(ref server) = query.server_service {
-        filters.push_str(&format!(" AND server_service = '{}'", server));
-    }
-    if let Some(ref stream) = query.stream_name {
-        filters.push_str(&format!(" AND trace_stream_name = '{}'", stream));
-    }
-
-    let sql = format!(
-        "SELECT _timestamp, p50_latency_ns, p95_latency_ns, p99_latency_ns, \
-         total_requests, failed_requests \
-         FROM \"{}\" WHERE {} ORDER BY _timestamp ASC LIMIT 10000",
-        stream_name, filters
+    let sql = build_edge_history_sql(
+        stream_name,
+        &org_id,
+        query.client_service.as_deref(),
+        query.server_service.as_deref(),
+        query.stream_name.as_deref(),
+        start_time,
+        end_time,
     );
 
     let req = config::meta::search::Request {
@@ -631,10 +664,12 @@ pub async fn get_current_topology(
     MetaHttpResponse::forbidden("Not Supported")
 }
 
-#[cfg(all(test, feature = "enterprise"))]
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "enterprise")]
     fn make_record(
         client: Option<&str>,
         server: &str,
@@ -656,12 +691,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn test_aggregate_baselines_empty_returns_empty() {
         let result = aggregate_baselines(vec![]);
         assert!(result.is_empty());
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn test_aggregate_baselines_single_record() {
         let records = vec![make_record(Some("svc-a"), "svc-b", 100, 200, 300, 10)];
         let result = aggregate_baselines(records);
@@ -675,6 +712,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn test_aggregate_baselines_skips_missing_server_service() {
         let mut m = serde_json::Map::new();
         m.insert("client_service".to_string(), serde_json::json!("svc-a"));
@@ -687,6 +725,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn test_aggregate_baselines_merges_multiple_records() {
         let records = vec![
             make_record(Some("svc-a"), "svc-b", 100, 200, 300, 10),
@@ -701,6 +740,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn test_aggregate_baselines_filters_zero_request_entries() {
         let records = vec![make_record(Some("svc-a"), "svc-b", 100, 200, 300, 0)];
         let result = aggregate_baselines(records);
@@ -770,6 +810,41 @@ mod tests {
     }
 
     #[test]
+    fn test_build_edges_sql_escapes_org_and_stream_filter() {
+        let sql = build_edges_sql("_o2_service_graph", Some("a'b"), 1, 2, "o'rg", None);
+        assert!(sql.contains("org_id = 'o''rg'"));
+        assert!(sql.contains("trace_stream_name = 'a''b'"));
+        assert!(!sql.contains("'o'rg'"));
+        // org_id is interpolated in the unfiltered branch too; a partial fix would miss it.
+        let sql = build_edges_sql("_o2_service_graph", None, 1, 2, "o'rg", None);
+        assert!(sql.contains("org_id = 'o''rg'"));
+        assert_eq!(sql.matches('\'').count() % 2, 0);
+    }
+
+    #[test]
+    fn test_build_edge_history_sql_escapes_all_filters() {
+        let sql = build_edge_history_sql(
+            "_o2_service_graph",
+            "o'rg",
+            Some("c'l"),
+            Some("s'v"),
+            Some("st'm"),
+            1,
+            2,
+        );
+        for frag in [
+            "org_id = 'o''rg'",
+            "client_service = 'c''l'",
+            "server_service = 's''v'",
+            "trace_stream_name = 'st''m'",
+        ] {
+            assert!(sql.contains(frag), "missing {frag}");
+        }
+        assert_eq!(sql.matches('\'').count() % 2, 0);
+    }
+
+    #[test]
+    #[cfg(feature = "enterprise")]
     fn test_aggregate_baselines_null_client_service() {
         let records = vec![make_record(None, "svc-b", 50, 100, 150, 5)];
         let result = aggregate_baselines(records);
@@ -782,6 +857,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "enterprise")]
     fn test_v4_read_filter_maps_stream_and_env_only() {
         let query = |stream: Option<&str>, env: Option<&str>| ServiceGraphQuery {
             start_time: None,
